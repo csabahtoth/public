@@ -409,7 +409,7 @@ success "niri config written"
 cat >> "/home/${USERNAME}/.bash_profile" << 'PROFILE_EOF'
 
 # Launch niri-session automatically on TTY1
-if [[ -z "${WAYLAND_DISPLAY}" ]] && [[ "${XDG_VTNR}" == "1" ]]; then
+if [[ -z "\${WAYLAND_DISPLAY}" ]] && [[ "\${XDG_VTNR}" == "1" ]]; then
     exec niri-session
 fi
 PROFILE_EOF
@@ -417,7 +417,7 @@ PROFILE_EOF
 # ── Auto-login on TTY1 ────────────────────────────────────────────────────
 info "Configuring TTY1 auto-login for ${USERNAME}"
 mkdir -p /etc/systemd/system/getty@tty1.service.d
-cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << AUTOLOGIN_EOF
+cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << 'AUTOLOGIN_EOF'
 [Service]
 ExecStart=
 ExecStart=-/sbin/agetty --autologin ${USERNAME} --noclear %I \$TERM
