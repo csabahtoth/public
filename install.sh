@@ -32,6 +32,14 @@ echo "  ╚═══════════════════════
 echo -e "${NC}"
 
 # ── Gather input ──────────────────────────────────────────────────────────────
+
+# Keyboard layout first so the live environment uses the correct layout
+# before the user types passwords
+ask "Keyboard layout [us]:"
+read -r KEYMAP
+KEYMAP="${KEYMAP:-us}"
+loadkeys "$KEYMAP" 2>/dev/null || warn "loadkeys failed for '${KEYMAP}' — continuing anyway"
+
 info "Available disks"
 lsblk -d -o NAME,SIZE,MODEL | grep -v loop
 echo
@@ -45,6 +53,15 @@ ask "Hostname:"
 read -r HOSTNAME
 [[ -n "$HOSTNAME" ]] || die "Hostname cannot be empty"
 
+ask "Timezone, e.g. Europe/London, America/New_York [UTC]:"
+read -r TIMEZONE
+TIMEZONE="${TIMEZONE:-UTC}"
+[[ -f "/usr/share/zoneinfo/${TIMEZONE}" ]] || die "Unknown timezone: ${TIMEZONE}"
+
+ask "Locale [en_US.UTF-8]:"
+read -r LOCALE
+LOCALE="${LOCALE:-en_US.UTF-8}"
+
 ask "Username:"
 read -r USERNAME
 [[ -n "$USERNAME" ]] || die "Username cannot be empty"
@@ -57,19 +74,6 @@ read -rs USER_PASS2; echo
 
 ask "Root password (leave blank to lock the root account):"
 read -rs ROOT_PASS; echo
-
-ask "Timezone, e.g. Europe/London, America/New_York [UTC]:"
-read -r TIMEZONE
-TIMEZONE="${TIMEZONE:-UTC}"
-[[ -f "/usr/share/zoneinfo/${TIMEZONE}" ]] || die "Unknown timezone: ${TIMEZONE}"
-
-ask "Locale [en_US.UTF-8]:"
-read -r LOCALE
-LOCALE="${LOCALE:-en_US.UTF-8}"
-
-ask "Keyboard layout [us]:"
-read -r KEYMAP
-KEYMAP="${KEYMAP:-us}"
 
 # ── Confirmation ──────────────────────────────────────────────────────────────
 echo
@@ -244,6 +248,18 @@ echo "${USERNAME}:${USER_PASS}" | chpasswd
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 success "User created"
 
+# ── Activate swap inside chroot (kernel is shared but swapon state may not be) ──
+info "Activating swap"
+swapon -a || true
+success "Swap active"
+
+# ── Limit parallel compile jobs to avoid OOM on low-RAM VMs ──────────────
+# noctalia-qs is a large C++/Qt project; -j1 is slow but safe in a VM.
+# Raise to -j2 or -j$(nproc) if you have 8 GB+ RAM allocated to the VM.
+sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j1"/' /etc/makepkg.conf
+grep -q '^MAKEFLAGS=' /etc/makepkg.conf || echo 'MAKEFLAGS="-j1"' >> /etc/makepkg.conf
+success "MAKEFLAGS set to -j1"
+
 # ── paru (AUR helper) ──────────────────────────────────────────────────────
 info "Installing paru (AUR helper)"
 su - "${USERNAME}" << 'PARU_EOF'
@@ -256,8 +272,8 @@ PARU_EOF
 success "paru installed"
 
 # ── Noctalia shell (AUR) ───────────────────────────────────────────────────
-info "Installing Noctalia shell from AUR (may take a while)"
-su - "${USERNAME}" -c 'paru -S --noconfirm noctalia-shell noctalia-qs'
+info "Installing Noctalia shell from AUR (this will take 15-30 min with -j1)"
+su - "${USERNAME}" -c 'paru -S --noconfirm noctalia-shell'
 success "Noctalia installed"
 
 # ── Niri config ────────────────────────────────────────────────────────────
@@ -320,18 +336,12 @@ window-rule {
 }
 layer-rule {
     match namespace="^noctalia-(background|launcher-overlay|dock)-.*$"
-    background-effect { xray false }
-}
-blur {
-    passes 2
-    offset 3.0
-    noise 0.03
-    saturation 1.0
+    background-effect { blur true }
 }
 
 // ── Noctalia — wallpaper (blurred overview mode) ──────────────────────────
 layer-rule {
-    match namespace="^noctalia-overview*"
+    match namespace="^noctalia-overview"
     place-within-backdrop true
 }
 
@@ -343,7 +353,7 @@ debug {
 // ── Autostart ────────────────────────────────────────────────────────────
 spawn-at-startup "noctalia-shell"
 spawn-at-startup "mako"
-spawn-at-startup "xwayland-satellite"
+// xwayland-satellite is managed automatically by niri (v25.08+) — no spawn needed
 
 // ── Key bindings ─────────────────────────────────────────────────────────
 binds {
@@ -409,7 +419,8 @@ success "niri config written"
 cat >> "/home/${USERNAME}/.bash_profile" << 'PROFILE_EOF'
 
 # Launch niri-session automatically on TTY1
-if [[ -z "\${WAYLAND_DISPLAY}" ]] && [[ "\${XDG_VTNR}" == "1" ]]; then
+# Using tty instead of XDG_VTNR — the latter is not set by agetty auto-login
+if [ -z "\${WAYLAND_DISPLAY}" ] && [ "\$(tty)" = "/dev/tty1" ]; then
     exec niri-session
 fi
 PROFILE_EOF
@@ -420,7 +431,7 @@ mkdir -p /etc/systemd/system/getty@tty1.service.d
 cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << 'AUTOLOGIN_EOF'
 [Service]
 ExecStart=
-ExecStart=-/sbin/agetty --autologin ${USERNAME} --noclear %I \$TERM
+ExecStart=-/usr/bin/agetty --autologin ${USERNAME} --noclear %I \$TERM
 AUTOLOGIN_EOF
 success "Auto-login configured"
 
