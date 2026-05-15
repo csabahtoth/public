@@ -9,7 +9,7 @@
 #   ./arch-niri-noctalia.sh --hardware # Full install for Framework 13 AMD
 #
 # Usage (from GitHub) — MUST use process substitution, NOT curl | bash,
-# so stdin stays attached to your terminal for sudo password prompts:
+# so stdin stays attached to your terminal for sudo/password prompts:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/arch-niri-noctalia.sh)
 #   bash <(curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/arch-niri-noctalia.sh) --hardware
 
@@ -22,9 +22,43 @@ success() { echo -e "${GREEN}[OK]${NC}   $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()     { echo -e "${RED}[ERR]${NC}  $*"; exit 1; }
 
-# ── Sanity checks ─────────────────────────────────────────────────────────────
-[[ $EUID -eq 0 ]] && err "Run as your regular user, not root. sudo will be called where needed."
+# ── Sanity check ──────────────────────────────────────────────────────────────
 command -v pacman &>/dev/null || err "pacman not found — this script requires Arch Linux."
+
+# ── Root / sudo detection ─────────────────────────────────────────────────────
+# On a fresh minimal Arch install sudo is not present and the user is typically
+# root. We support both modes:
+#   root        → SUDO="" so every $SUDO call runs directly; makepkg gets
+#                 --allow-root because it refuses to build as root otherwise.
+#   normal user → SUDO="sudo"; we verify sudo is installed and working before
+#                 doing anything else.
+if [[ $EUID -eq 0 ]]; then
+    warn "Running as root."
+    warn "This works, but creating a regular user for daily use is recommended:"
+    warn "  useradd -m -G wheel -s /bin/bash USERNAME && passwd USERNAME"
+    echo ""
+    SUDO=""
+    MAKEPKG_EXTRA="--allow-root"
+    # When root, $USER is 'root'. We only add real users to video/input groups.
+    TARGET_USER=""
+else
+    # Ensure sudo is installed — it is NOT included in a minimal Arch base.
+    if ! command -v sudo &>/dev/null; then
+        err "sudo is not installed. Log in as root and run:" \
+            $'\n'"  pacman -S sudo" \
+            $'\n'"  usermod -aG wheel $USER" \
+            $'\n'"  EDITOR=nano visudo   # uncomment: %wheel ALL=(ALL:ALL) ALL"
+    fi
+    # Ensure this user can actually use sudo before any privileged command runs.
+    if ! sudo -v 2>/dev/null; then
+        err "$USER cannot use sudo. As root, run:" \
+            $'\n'"  usermod -aG wheel $USER" \
+            $'\n'"  EDITOR=nano visudo   # uncomment: %wheel ALL=(ALL:ALL) ALL"
+    fi
+    SUDO="sudo"
+    MAKEPKG_EXTRA=""
+    TARGET_USER="$USER"
+fi
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 HARDWARE_MODE=false
@@ -37,20 +71,21 @@ echo ""
 
 # ── 1. Full system update ─────────────────────────────────────────────────────
 info "Updating system..."
-sudo pacman -Syu --noconfirm
+$SUDO pacman -Syu --noconfirm
 
 # ── 2. Base build tools (needed to compile AUR packages) ─────────────────────
 info "Installing base-devel and git..."
-sudo pacman -S --needed --noconfirm base-devel git curl
+$SUDO pacman -S --needed --noconfirm base-devel git curl
 
 # ── 3. AUR helper: paru ───────────────────────────────────────────────────────
 if ! command -v paru &>/dev/null; then
     info "Installing paru (AUR helper)..."
     tmpdir=$(mktemp -d)
-    # Trap ensures tmpdir is cleaned up even if makepkg fails
     trap 'rm -rf "$tmpdir"' EXIT
     git clone https://aur.archlinux.org/paru-bin.git "$tmpdir/paru"
-    (cd "$tmpdir/paru" && makepkg -si --noconfirm)
+    # makepkg refuses to run as root without --allow-root; $MAKEPKG_EXTRA holds
+    # that flag when we are root, and is empty otherwise.
+    (cd "$tmpdir/paru" && makepkg -si --noconfirm $MAKEPKG_EXTRA)
     trap - EXIT
     rm -rf "$tmpdir"
     success "paru installed"
@@ -60,7 +95,7 @@ fi
 
 # ── 4. Core Wayland / niri stack (official repos) ────────────────────────────
 info "Installing niri and core Wayland components..."
-sudo pacman -S --needed --noconfirm \
+$SUDO pacman -S --needed --noconfirm \
     niri \
     xwayland-satellite \
     xdg-desktop-portal \
@@ -77,17 +112,17 @@ sudo pacman -S --needed --noconfirm \
 
 # ── 5. Session & display manager ─────────────────────────────────────────────
 info "Installing greetd + tuigreet display manager..."
-sudo pacman -S --needed --noconfirm greetd greetd-tuigreet
+$SUDO pacman -S --needed --noconfirm greetd greetd-tuigreet
 
 # Disable any display manager that may already be enabled to avoid boot conflicts.
 for dm in sddm lightdm gdm lxdm ly; do
     if systemctl is-enabled "$dm" &>/dev/null; then
-        sudo systemctl disable "$dm"
+        $SUDO systemctl disable "$dm"
         info "Disabled $dm (replaced by greetd)"
     fi
 done
 
-sudo tee /etc/greetd/config.toml > /dev/null <<'EOF'
+$SUDO tee /etc/greetd/config.toml > /dev/null <<'EOF'
 [terminal]
 vt = 1
 
@@ -96,12 +131,12 @@ command = "tuigreet --time --remember --cmd niri-session"
 user = "greeter"
 EOF
 
-sudo systemctl enable greetd
+$SUDO systemctl enable greetd
 
-# Add gnome-keyring PAM lines to greetd so the keyring auto-unlocks on login.
+# Add gnome-keyring PAM lines so the keyring auto-unlocks on login.
 # Without this the daemon starts but the wallet stays locked until manually opened.
 if ! grep -q "pam_gnome_keyring" /etc/pam.d/greetd 2>/dev/null; then
-    sudo tee -a /etc/pam.d/greetd > /dev/null <<'EOF'
+    $SUDO tee -a /etc/pam.d/greetd > /dev/null <<'EOF'
 auth       optional     pam_gnome_keyring.so
 session    optional     pam_gnome_keyring.so auto_start
 EOF
@@ -112,7 +147,7 @@ success "greetd configured"
 
 # ── 6. Audio (pipewire assumed installed; ensure stack is complete) ────────────
 info "Ensuring pipewire/wireplumber stack is complete..."
-sudo pacman -S --needed --noconfirm \
+$SUDO pacman -S --needed --noconfirm \
     pipewire \
     pipewire-alsa \
     pipewire-pulse \
@@ -122,7 +157,7 @@ sudo pacman -S --needed --noconfirm \
 
 # ── 7. Network & Bluetooth ────────────────────────────────────────────────────
 info "Installing NetworkManager and Bluetooth..."
-sudo pacman -S --needed --noconfirm \
+$SUDO pacman -S --needed --noconfirm \
     networkmanager \
     network-manager-applet \
     bluez \
@@ -133,22 +168,22 @@ sudo pacman -S --needed --noconfirm \
 # Minimal Arch installs typically enable dhcpcd on the wired interface.
 for svc in dhcpcd iwd systemd-networkd; do
     if systemctl is-enabled "$svc" &>/dev/null; then
-        sudo systemctl disable --now "$svc"
+        $SUDO systemctl disable --now "$svc"
         info "Disabled $svc (replaced by NetworkManager)"
     fi
 done
 
-sudo systemctl enable NetworkManager
-sudo systemctl enable bluetooth
+$SUDO systemctl enable NetworkManager
+$SUDO systemctl enable bluetooth
 success "NetworkManager + Bluetooth enabled"
 
 # ── 8. Polkit authentication agent ───────────────────────────────────────────
 info "Installing polkit authentication agent..."
-sudo pacman -S --needed --noconfirm polkit polkit-gnome
+$SUDO pacman -S --needed --noconfirm polkit polkit-gnome
 
 # ── 9. Fonts ──────────────────────────────────────────────────────────────────
 info "Installing fonts..."
-sudo pacman -S --needed --noconfirm \
+$SUDO pacman -S --needed --noconfirm \
     noto-fonts \
     noto-fonts-emoji \
     noto-fonts-cjk \
@@ -158,7 +193,7 @@ sudo pacman -S --needed --noconfirm \
 
 # ── 10. GTK / Qt theming tools ───────────────────────────────────────────────
 info "Installing theming tools..."
-sudo pacman -S --needed --noconfirm \
+$SUDO pacman -S --needed --noconfirm \
     gnome-themes-extra \
     adwaita-icon-theme \
     papirus-icon-theme \
@@ -170,7 +205,7 @@ sudo pacman -S --needed --noconfirm \
 
 # ── 11. Terminal, launcher, file manager ─────────────────────────────────────
 info "Installing terminal, launcher, and file manager..."
-sudo pacman -S --needed --noconfirm \
+$SUDO pacman -S --needed --noconfirm \
     foot \
     alacritty \
     fuzzel \
@@ -180,7 +215,7 @@ sudo pacman -S --needed --noconfirm \
 
 # ── 12. Noctalia dependencies (official repos) ───────────────────────────────
 info "Installing Noctalia dependencies from official repos..."
-sudo pacman -S --needed --noconfirm \
+$SUDO pacman -S --needed --noconfirm \
     brightnessctl \
     imagemagick \
     python \
@@ -192,7 +227,7 @@ sudo pacman -S --needed --noconfirm \
     ddcutil \
     libnotify
 
-sudo systemctl enable power-profiles-daemon
+$SUDO systemctl enable power-profiles-daemon
 success "power-profiles-daemon enabled"
 
 # ── 13. Noctalia shell from AUR ───────────────────────────────────────────────
@@ -204,13 +239,13 @@ success "noctalia-shell installed"
 
 # ── 14. Secrets / keyring ─────────────────────────────────────────────────────
 info "Installing gnome-keyring..."
-sudo pacman -S --needed --noconfirm gnome-keyring libsecret
+$SUDO pacman -S --needed --noconfirm gnome-keyring libsecret
 
 # ── 15. Hardware-specific: Framework 13 AMD 7040 ─────────────────────────────
 if [[ "$HARDWARE_MODE" == true ]]; then
     info "Installing Framework 13 AMD 7040 hardware packages..."
 
-    sudo pacman -S --needed --noconfirm \
+    $SUDO pacman -S --needed --noconfirm \
         vulkan-radeon \
         libva-mesa-driver \
         mesa-vdpau \
@@ -222,37 +257,37 @@ if [[ "$HARDWARE_MODE" == true ]]; then
     # thermald intentionally excluded — it is Intel-only. AMD uses kernel-native
     # thermal management (k10temp driver + RAPL). No userspace daemon needed.
 
-    sudo systemctl enable acpid
-    sudo systemctl enable fwupd
+    $SUDO systemctl enable acpid
+    $SUDO systemctl enable fwupd
 
     # amd-ucode only takes effect after GRUB's config is regenerated so the
     # bootloader knows to pass the microcode initrd image to the kernel.
     if command -v grub-mkconfig &>/dev/null; then
         info "Regenerating GRUB config to activate AMD microcode..."
-        sudo grub-mkconfig -o /boot/grub/grub.cfg
+        $SUDO grub-mkconfig -o /boot/grub/grub.cfg
     else
         warn "grub-mkconfig not found — regenerate your bootloader config manually to activate amd-ucode."
     fi
 
-    # Framework-specific: s2idle is the correct suspend target for AMD
+    # Framework-specific: s2idle is the correct suspend target for AMD.
     # For GRUB, add to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub,
-    # then run: sudo grub-mkconfig -o /boot/grub/grub.cfg
+    # then run: grub-mkconfig -o /boot/grub/grub.cfg
     if ! grep -q "mem_sleep_default=s2idle" /etc/default/grub 2>/dev/null; then
         warn "For proper suspend on Framework AMD, add 'mem_sleep_default=s2idle' to"
         warn "GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, then run:"
-        warn "  sudo grub-mkconfig -o /boot/grub/grub.cfg"
+        warn "  grub-mkconfig -o /boot/grub/grub.cfg"
     fi
 
-    # AMD PSR (Panel Self Refresh) — reduces idle display power draw
+    # AMD PSR (Panel Self Refresh) — reduces idle display power draw.
     # Use -r to safely search a possibly empty /etc/modprobe.d/
     if ! grep -qr "dcdebugmask" /etc/modprobe.d/ 2>/dev/null; then
-        echo "options amdgpu dcdebugmask=0x10" | sudo tee /etc/modprobe.d/amdgpu-framework.conf > /dev/null
+        echo "options amdgpu dcdebugmask=0x10" | $SUDO tee /etc/modprobe.d/amdgpu-framework.conf > /dev/null
         info "AMD dcdebugmask option written (enables PSR for display power saving)"
     fi
 
-    # ddcutil requires the i2c-dev kernel module for external monitor control
+    # ddcutil requires the i2c-dev kernel module for external monitor control.
     if ! grep -qr "i2c-dev" /etc/modules-load.d/ 2>/dev/null; then
-        echo "i2c-dev" | sudo tee /etc/modules-load.d/i2c-dev.conf > /dev/null
+        echo "i2c-dev" | $SUDO tee /etc/modules-load.d/i2c-dev.conf > /dev/null
         info "i2c-dev module configured for ddcutil"
     fi
 
@@ -396,9 +431,9 @@ fi
 # ── 17. System-wide environment variables (/etc/environment) ─────────────────
 info "Setting system-wide environment variables..."
 
-# Idempotent: only append the block if it isn't already present
+# Idempotent: only append the block if it isn't already present.
 if ! grep -q "XDG_SESSION_DESKTOP=niri" /etc/environment 2>/dev/null; then
-    sudo tee -a /etc/environment > /dev/null <<'EOF'
+    $SUDO tee -a /etc/environment > /dev/null <<'EOF'
 
 # Wayland / niri session
 XDG_SESSION_TYPE=wayland
@@ -422,11 +457,11 @@ fi
 # is the correct invocation for a full login session with D-Bus activation.
 if [[ ! -f /usr/local/bin/niri-session ]]; then
     info "Creating niri-session wrapper..."
-    sudo tee /usr/local/bin/niri-session > /dev/null <<'EOF'
+    $SUDO tee /usr/local/bin/niri-session > /dev/null <<'EOF'
 #!/bin/sh
 exec niri --session
 EOF
-    sudo chmod +x /usr/local/bin/niri-session
+    $SUDO chmod +x /usr/local/bin/niri-session
     success "niri-session wrapper created"
 else
     success "niri-session wrapper already exists — skipped"
@@ -437,7 +472,7 @@ info "Configuring XDG portals for niri..."
 mkdir -p "$HOME/.config/xdg-desktop-portal"
 
 # Portal resolution order: gnome portal (screensharing) → gtk portal (file picker etc.)
-# File is named after XDG_CURRENT_DESKTOP so xdg-desktop-portal picks it up automatically
+# File is named after XDG_CURRENT_DESKTOP so xdg-desktop-portal picks it up automatically.
 cat > "$HOME/.config/xdg-desktop-portal/niri-portals.conf" <<'EOF'
 [preferred]
 default=gnome;gtk
@@ -446,9 +481,14 @@ EOF
 success "Portal config written"
 
 # ── 20. User group membership ─────────────────────────────────────────────────
-info "Adding $USER to video and input groups..."
-sudo usermod -aG video,input "$USER"
-success "$USER added to video and input groups (effective on next login)"
+# Only meaningful for real user accounts; skip when running as root.
+if [[ -n "$TARGET_USER" ]]; then
+    info "Adding $TARGET_USER to video and input groups..."
+    $SUDO usermod -aG video,input "$TARGET_USER"
+    success "$TARGET_USER added to video and input groups (effective on next login)"
+else
+    warn "Skipping group membership step (running as root — apply to your user account manually)."
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
@@ -466,13 +506,21 @@ echo "   • qt5-wayland + qt6-wayland (native Wayland for Qt apps)"
 [[ "$HARDWARE_MODE" == true ]] && echo "   • Framework 13 AMD 7040 hardware packages"
 echo ""
 echo "  Next steps:"
-echo "   1. Reboot:  sudo reboot"
+echo "   1. Reboot"
 echo "   2. Log in via greetd — niri session starts automatically"
 echo "   3. Noctalia shell launches automatically via niri config"
 echo "   4. Customise ~/.config/niri/config.kdl for keybinds/layout"
 echo "   5. Set GTK theme:  nwg-look"
 echo "      Set Qt theme:   qt6ct"
 echo ""
+if [[ -z "$TARGET_USER" ]]; then
+    echo -e "  ${YELLOW}You ran as root. Before rebooting:${NC}"
+    echo "   • Create a user:  useradd -m -G wheel,video,input -s /bin/bash USERNAME"
+    echo "   • Set password:   passwd USERNAME"
+    echo "   • Install sudo:   pacman -S sudo"
+    echo "   • Edit sudoers:   EDITOR=nano visudo  (uncomment %wheel line)"
+    echo ""
+fi
 if [[ "$HARDWARE_MODE" == false ]]; then
     echo -e "  ${YELLOW}When moving to Framework 13 AMD:${NC}"
     echo "   Run again with:  ./arch-niri-noctalia.sh --hardware"
