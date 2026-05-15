@@ -13,7 +13,10 @@
 #   bash <(curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/arch-niri-noctalia.sh)
 #   bash <(curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/arch-niri-noctalia.sh) --hardware
 
-set -euo pipefail
+set -eo pipefail
+
+# Print the line number of any unexpected failure so the user can report it.
+trap 'echo -e "\033[0;31m[FATAL]\033[0m Script failed at line ${LINENO}. Exit code: $?" >&2' ERR
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -22,14 +25,17 @@ success() { echo -e "${GREEN}[OK]${NC}   $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()     { echo -e "${RED}[ERR]${NC}  $*"; exit 1; }
 
+# USER may be unset in minimal environments; derive it safely once here.
+CURRENT_USER="$(id -un)"
+
 # ── Sanity check ──────────────────────────────────────────────────────────────
 command -v pacman &>/dev/null || err "pacman not found — this script requires Arch Linux."
 
 # ── Root / sudo detection ─────────────────────────────────────────────────────
 # On a fresh minimal Arch install sudo is not present and the user is typically
 # root. We support both modes:
-#   root        → SUDO="" so every $SUDO call runs directly; makepkg gets
-#                 --allow-root because it refuses to build as root otherwise.
+#   root        → SUDO="" so every $SUDO call runs directly; a temporary
+#                 _aurbuild user handles the paru build step (makepkg blocks root).
 #   normal user → SUDO="sudo"; we verify sudo is installed and working before
 #                 doing anything else.
 if [[ $EUID -eq 0 ]]; then
@@ -38,26 +44,24 @@ if [[ $EUID -eq 0 ]]; then
     warn "  useradd -m -G wheel -s /bin/bash USERNAME && passwd USERNAME"
     echo ""
     SUDO=""
-    MAKEPKG_EXTRA="--allow-root"
-    # When root, $USER is 'root'. We only add real users to video/input groups.
+    # When root, we only add real user accounts to video/input groups.
     TARGET_USER=""
 else
     # Ensure sudo is installed — it is NOT included in a minimal Arch base.
     if ! command -v sudo &>/dev/null; then
         err "sudo is not installed. Log in as root and run:" \
             $'\n'"  pacman -S sudo" \
-            $'\n'"  usermod -aG wheel $USER" \
+            $'\n'"  usermod -aG wheel $CURRENT_USER" \
             $'\n'"  EDITOR=nano visudo   # uncomment: %wheel ALL=(ALL:ALL) ALL"
     fi
     # Ensure this user can actually use sudo before any privileged command runs.
     if ! sudo -v 2>/dev/null; then
-        err "$USER cannot use sudo. As root, run:" \
-            $'\n'"  usermod -aG wheel $USER" \
+        err "$CURRENT_USER cannot use sudo. As root, run:" \
+            $'\n'"  usermod -aG wheel $CURRENT_USER" \
             $'\n'"  EDITOR=nano visudo   # uncomment: %wheel ALL=(ALL:ALL) ALL"
     fi
     SUDO="sudo"
-    MAKEPKG_EXTRA=""
-    TARGET_USER="$USER"
+    TARGET_USER="$CURRENT_USER"
 fi
 
 # ── Args ──────────────────────────────────────────────────────────────────────
@@ -83,9 +87,22 @@ if ! command -v paru &>/dev/null; then
     tmpdir=$(mktemp -d)
     trap 'rm -rf "$tmpdir"' EXIT
     git clone https://aur.archlinux.org/paru-bin.git "$tmpdir/paru"
-    # makepkg refuses to run as root without --allow-root; $MAKEPKG_EXTRA holds
-    # that flag when we are root, and is empty otherwise.
-    (cd "$tmpdir/paru" && makepkg -si --noconfirm $MAKEPKG_EXTRA)
+
+    if [[ $EUID -eq 0 ]]; then
+        # makepkg hard-blocks root. Build under a throwaway user, then install
+        # the resulting .pkg.tar.zst directly with 'pacman -U' (no sudo needed
+        # since we are already root).
+        useradd -m -s /bin/bash _aurbuild 2>/dev/null || true
+        mkdir -p /tmp/_paru_build
+        cp -r "$tmpdir/paru/." /tmp/_paru_build/
+        chown -R _aurbuild:_aurbuild /tmp/_paru_build
+        su -s /bin/bash _aurbuild -c "cd /tmp/_paru_build && makepkg --noconfirm"
+        pacman -U --noconfirm /tmp/_paru_build/*.pkg.tar.zst
+        userdel -r _aurbuild 2>/dev/null || true
+        rm -rf /tmp/_paru_build
+    else
+        (cd "$tmpdir/paru" && makepkg -si --noconfirm)
+    fi
     trap - EXIT
     rm -rf "$tmpdir"
     success "paru installed"
